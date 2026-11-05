@@ -114,6 +114,9 @@ pub fn show(
                     .layouter(&mut layouter)
                     .show(ui);
 
+                output.response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::Role::MultilineTextInput, !args.read_only, "Assembly source")
+                });
                 result.changed = output.response.changed();
 
                 let galley = &output.galley;
@@ -375,9 +378,32 @@ pub fn highlight(src: &str, font_id: &FontId, theme: &Theme, char_w: f32, tab_wi
 /// (egui itself renders every tab as a fixed width).
 pub const TAB_FAMILY: &str = "varan_tab";
 
-/// Register the zero-width-tab font family. Call once at startup.
+/// Read the first system font file that exists. Fonts are loaded at runtime
+/// (not embedded) so the executable stays small; egui's bundled fonts remain
+/// as fallbacks if none are found.
+fn system_font(candidates: &[&str]) -> Option<egui::FontData> {
+    let dir = std::env::var_os("WINDIR")
+        .map(|w| std::path::PathBuf::from(w).join("Fonts"))
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows\Fonts"));
+    candidates
+        .iter()
+        .find_map(|name| std::fs::read(dir.join(name)).ok())
+        .map(egui::FontData::from_owned)
+}
+
+/// Install the UI/code fonts and the zero-width-tab font family. Call once at startup.
 pub fn install_fonts(ctx: &egui::Context) {
     let mut defs = egui::FontDefinitions::default();
+    if cfg!(windows) {
+        let mut prepend = |family: FontFamily, key: &str, files: &[&str]| {
+            if let Some(data) = system_font(files) {
+                defs.font_data.insert(key.to_string(), Arc::new(data));
+                defs.families.entry(family).or_default().insert(0, key.to_string());
+            }
+        };
+        prepend(FontFamily::Proportional, "ui-system", &["segoeui.ttf"]);
+        prepend(FontFamily::Monospace, "mono-system", &["CascadiaMono.ttf", "consola.ttf"]);
+    }
     let mono = defs.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
     if let Some(data) = mono.first().and_then(|name| defs.font_data.get(name)).cloned() {
         let mut data = (*data).clone();

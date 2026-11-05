@@ -10,6 +10,7 @@ assembly for the COMP1054 course. It replaces KoMoDo. The GUI uses eframe/egui
 cargo run                      # debug GUI (starts with a sample program)
 cargo run --release -- file.s  # open a file
 cargo test                     # all tests (library + GUI-side tests)
+cargo test preview -- --ignored  # render the UI offscreen to target/preview/*.png (needs a GPU)
 cargo build --release          # -> target\release\varan.exe (single file)
 ```
 
@@ -41,7 +42,12 @@ The binary is `src/main.rs`:
   tab-stop rendering, and `install_fonts`.
 - `fileformat.rs` loads and saves files losslessly. It remembers CRLF/LF, a UTF-8
   BOM and Latin-1, so an unedited file saves byte-identical.
-- `theme.rs` has the dark and light colour palettes.
+- `theme.rs` has the dark and light colour palettes and the egui widget styling.
+- `widgets.rs` has vector-drawn icons (no emoji fonts), toolbar buttons, tab bars and status pills.
+- `cheatsheet.rs` is the F1 Instruction Reference window (the COMP1054 summary as searchable
+  tables). It also embeds `docs/ARMInst.pdf` for Help -> Open COMP1054 Summary (PDF).
+- UI fonts load from `%WINDIR%/Fonts` at runtime (Segoe UI, Cascadia Mono or Consolas) in
+  `editor::install_fonts`, falling back to the egui defaults.
 
 ## Assembler conventions
 
@@ -73,7 +79,7 @@ The binary is `src/main.rs`:
   next tab stop. Never rewrite users' whitespace.
 - **Headless egui tests:** use `ctx.begin_pass(RawInput::default())`, and finish
   with `ctx.end_pass().textures_delta.clear()`. Without that clear, the test panics.
-- **Source files have CRLF line endings.** Multi-line string replacements in
+- **`src/app.rs` has CRLF line endings (other sources are LF); keep it that way.** Multi-line string replacements in
   Python or sed silently fail to match, and backslash escapes in bash heredocs
   passed to Python get mangled. Use the Edit/Write tools for code edits.
 - **Do not drive the GUI with synthetic keyboard/mouse input or full-screen

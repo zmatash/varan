@@ -7,7 +7,9 @@ use eframe::egui::{
     text::{LayoutJob, TextFormat},
 };
 
+use crate::cheatsheet::{self, CheatSheet};
 use crate::editor::{self, EditorArgs, HighlightCache};
+use crate::widgets;
 use crate::fileformat::{FileFormat, decode_source, encode_source};
 use crate::theme::Theme;
 use varan::asm::{self, AsmError, Program};
@@ -37,6 +39,7 @@ fn sc_text(sc: &KeyboardShortcut) -> String {
 const SAMPLE: &str = r#"; Welcome to Varan - an ARM emulator for teaching.
 ;
 ; F7 assemble   F5 run   F11 step   F10 step over   Shift+F5 pause
+; F1 opens the ARM instruction reference.
 ; Click the line-number gutter to set breakpoints.
 ;
 ; SWI 0  print the character in R0
@@ -176,6 +179,11 @@ pub struct VaranApp {
     font_size: f32,
     tab_width: usize,
     theme: Theme,
+    /// Which theme the egui visuals were last set from.
+    applied_dark: Option<bool>,
+    cheatsheet: CheatSheet,
+    show_shortcuts: bool,
+    show_about: bool,
     pending: Option<Pending>,
     allow_close: bool,
     title: String,
@@ -183,14 +191,23 @@ pub struct VaranApp {
 
 impl VaranApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut app = Self::empty(cc);
+        // Open a file passed on the command line.
+        if let Some(path) = std::env::args().nth(1).map(PathBuf::from) {
+            app.load_file(path);
+        }
+        app
+    }
+
+    fn empty(cc: &eframe::CreationContext<'_>) -> Self {
         let theme = Theme::dark();
-        cc.egui_ctx.set_visuals(theme.visuals());
+        theme.apply(&cc.egui_ctx);
         editor::install_fonts(&cc.egui_ctx);
         cc.egui_ctx.global_style_mut(|s| {
             s.spacing.item_spacing = egui::vec2(8.0, 5.0);
             s.spacing.button_padding = egui::vec2(8.0, 3.0);
         });
-        let mut app = VaranApp {
+        VaranApp {
             source: SAMPLE.to_string(),
             file_path: None,
             dirty: false,
@@ -233,15 +250,14 @@ impl VaranApp {
             font_size: 14.0,
             tab_width: 8,
             theme,
+            applied_dark: None,
+            cheatsheet: CheatSheet::default(),
+            show_shortcuts: false,
+            show_about: false,
             pending: None,
             allow_close: false,
             title: String::new(),
-        };
-        // Open a file passed on the command line.
-        if let Some(path) = std::env::args().nth(1).map(PathBuf::from) {
-            app.load_file(path);
         }
-        app
     }
 
     // ------------------------------------------------------------------
@@ -722,6 +738,9 @@ impl VaranApp {
         if fire(sc(Modifiers::NONE, Key::F10)) {
             self.step_over();
         }
+        if fire(sc(Modifiers::NONE, Key::F1)) {
+            self.cheatsheet.toggle();
+        }
         if fire(sc(Modifiers::NONE, Key::F9)) {
             self.toggle_breakpoint(self.cursor.0);
         }
@@ -830,8 +849,11 @@ impl VaranApp {
                 let mut dark = self.theme.dark;
                 if ui.checkbox(&mut dark, "Dark theme").changed() {
                     self.theme = if dark { Theme::dark() } else { Theme::light() };
-                    ui.ctx().set_visuals(self.theme.visuals());
                 }
+                if ui.add(egui::Button::new("Instruction Reference").shortcut_text("F1")).clicked() {
+                    self.cheatsheet.toggle();
+                }
+                ui.separator();
                 ui.checkbox(&mut self.follow_pc, "Follow PC while stepping");
                 ui.checkbox(&mut self.echo_input, "Echo console input");
                 ui.horizontal(|ui| {
@@ -846,73 +868,140 @@ impl VaranApp {
                 });
             });
             ui.menu_button("Help", |ui| {
-                ui.label(RichText::new("Varan ARM Emulator").strong());
-                ui.label("A KoMoDo-compatible ARM assembler and emulator.");
+                if ui
+                    .add(egui::Button::new("Instruction Reference").shortcut_text("F1"))
+                    .on_hover_text("Searchable COMP1054 ARM instruction summary")
+                    .clicked()
+                {
+                    self.cheatsheet.toggle();
+                }
+                if ui.button("Open COMP1054 Summary (PDF)").clicked() {
+                    if let Err(e) = cheatsheet::open_pdf() {
+                        self.status_msg = e;
+                    }
+                }
                 ui.separator();
-                ui.label("SWI 0  print character in R0");
-                ui.label("SWI 1  read character into R0");
-                ui.label("SWI 2  halt");
-                ui.label("SWI 3  print string at address R0");
-                ui.label("SWI 4  print R0 as a decimal integer");
-                ui.separator();
-                ui.label("Directives: ENTRY, ORIGIN, ALIGN, EQU, DEFW, DEFB, DEFS, LTORG");
-                ui.label("Pseudo-ops: NOP, ADR, ADRL, LDR Rd,=value, PUSH, POP");
+                if ui.button("Keyboard Shortcuts").clicked() {
+                    self.show_shortcuts = true;
+                }
+                if ui.button("About Varan").clicked() {
+                    self.show_about = true;
+                }
             });
         });
     }
 
+    fn shortcuts_window(&mut self, ctx: &egui::Context) {
+        let theme = self.theme.clone();
+        let rows: Vec<(String, &str)> = vec![
+            ("F7".into(), "Assemble"),
+            ("F5".into(), "Run / continue"),
+            ("Shift+F5".into(), "Pause"),
+            ("F11".into(), "Step one instruction"),
+            ("F10".into(), "Step over (runs BL calls to completion)"),
+            (sc_text(&SC_RESET), "Reset the program"),
+            ("F9".into(), "Toggle breakpoint on the cursor line"),
+            ("F1".into(), "Instruction reference"),
+            (sc_text(&SC_NEW), "New file"),
+            (sc_text(&SC_OPEN), "Open file"),
+            (sc_text(&SC_SAVE), "Save"),
+            (sc_text(&SC_SAVE_AS), "Save as"),
+            (format!("{0}+= / {0}+-", if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" }), "Editor font size"),
+        ];
+        egui::Window::new("Keyboard Shortcuts")
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .open(&mut self.show_shortcuts)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::Grid::new("shortcuts").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+                    for (k, what) in &rows {
+                        widgets::key_cap(ui, &theme, k);
+                        ui.label(*what);
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(RichText::new("Click the line-number gutter to toggle a breakpoint.").color(theme.dim));
+            });
+    }
+
+    fn about_window(&mut self, ctx: &egui::Context) {
+        let theme = self.theme.clone();
+        egui::Window::new("About Varan")
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .open(&mut self.show_about)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_width(340.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Varan").size(24.0).strong().color(theme.accent));
+                    ui.label(RichText::new(format!("version {}", env!("CARGO_PKG_VERSION"))).color(theme.dim));
+                    ui.add_space(8.0);
+                    ui.label("An ARM assembler, emulator and debugger for COMP1054.");
+                    ui.label("Compatible with KoMoDo source files and SWI calls.");
+                    ui.add_space(4.0);
+                });
+            });
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        use widgets::{ButtonKind, Icon, tool_button};
+        let theme = self.theme.clone();
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
             let running = self.state == RunState::Running;
-            let big = |s: &str| RichText::new(s).size(14.5);
-            if ui
-                .add(egui::Button::new(big("🔨 Assemble")))
+            if tool_button(ui, &theme, Icon::Assemble, "Assemble", ButtonKind::Normal, !running)
                 .on_hover_text("Assemble and load the program (F7)")
                 .clicked()
             {
                 self.assemble_and_load();
             }
-            ui.separator();
+            toolbar_divider(ui, &theme);
             if running {
-                if ui.add(egui::Button::new(big("⏸ Pause"))).on_hover_text("Shift+F5").clicked() {
+                if tool_button(ui, &theme, Icon::Pause, "Pause", ButtonKind::Filled(theme.changed.gamma_multiply(0.85)), true)
+                    .on_hover_text("Pause (Shift+F5)")
+                    .clicked()
+                {
                     self.pause();
                 }
-            } else if ui
-                .add(egui::Button::new(big("▶ Run")).fill(self.theme.accent.linear_multiply(0.35)))
-                .on_hover_text("Run / continue (F5)")
-                .clicked()
-            {
-                self.run();
+            } else {
+                let label = if self.state == RunState::Paused && self.cpu.steps > 0 { "Continue" } else { "Run" };
+                if tool_button(ui, &theme, Icon::Run, label, ButtonKind::Filled(theme.run), true)
+                    .on_hover_text("Assemble if needed, then run until a breakpoint or halt (F5)")
+                    .clicked()
+                {
+                    self.run();
+                }
             }
-            if ui
-                .add_enabled(!running, egui::Button::new(big("⤵ Step")))
+            if tool_button(ui, &theme, Icon::Step, "Step", ButtonKind::Normal, !running)
                 .on_hover_text("Execute one instruction (F11)")
                 .clicked()
             {
                 self.step();
             }
-            if ui
-                .add_enabled(!running, egui::Button::new(big("↷ Step Over")))
-                .on_hover_text("Step, running over BL calls (F10)")
+            if tool_button(ui, &theme, Icon::StepOver, "Step Over", ButtonKind::Normal, !running)
+                .on_hover_text("Step, running BL calls to completion (F10)")
                 .clicked()
             {
                 self.step_over();
             }
-            if ui
-                .add(egui::Button::new(big("⟲ Reset")))
-                .on_hover_text(format!(
-                    "Reload the program and reset registers ({})",
-                    sc_text(&SC_RESET)
-                ))
+            if tool_button(ui, &theme, Icon::Reset, "Reset", ButtonKind::Normal, true)
+                .on_hover_text(format!("Reload the program and reset registers ({})", sc_text(&SC_RESET)))
                 .clicked()
                 && self.ensure_loaded()
             {
                 self.reset();
             }
-            ui.separator();
-            ui.label("Speed:");
+            toolbar_divider(ui, &theme);
+            let speed_label = ui.label(RichText::new("Speed").color(theme.dim));
             egui::ComboBox::from_id_salt("speed")
                 .selected_text(self.speed.label())
+                .width(110.0)
                 .show_ui(ui, |ui| {
                     for s in [
                         Speed::PerSecond(1),
@@ -924,11 +1013,21 @@ impl VaranApp {
                     ] {
                         ui.selectable_value(&mut self.speed, s, s.label());
                     }
-                });
+                })
+                .response
+                .labelled_by(speed_label.id)
+                .on_hover_text("How fast Run executes. Slow speeds animate each instruction.");
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if tool_button(ui, &theme, Icon::Book, "Reference", ButtonKind::Normal, true)
+                    .on_hover_text("ARM instruction reference (F1)")
+                    .clicked()
+                {
+                    self.cheatsheet.toggle();
+                }
+                ui.add_space(4.0);
                 let (text, color) = self.state_badge();
-                ui.label(RichText::new(text).color(color).strong());
+                widgets::status_pill(ui, text, color);
             });
         });
     }
@@ -936,15 +1035,15 @@ impl VaranApp {
     fn state_badge(&self) -> (&'static str, Color32) {
         let stale = self.state != RunState::NotLoaded && self.source_changed_since_load();
         if stale {
-            return ("● MODIFIED - reassemble", self.theme.warn_text);
+            return ("Modified - reassemble", self.theme.warn_text);
         }
         match self.state {
-            RunState::NotLoaded => ("● NOT ASSEMBLED", self.theme.dim),
-            RunState::Paused => ("● PAUSED", self.theme.accent),
-            RunState::Running => ("● RUNNING", self.theme.ok_text),
-            RunState::WaitingInput => ("● WAITING FOR INPUT", self.theme.warn_text),
-            RunState::Halted => ("● HALTED", self.theme.dim),
-            RunState::Error => ("● ERROR", self.theme.error_text),
+            RunState::NotLoaded => ("Not assembled", self.theme.dim),
+            RunState::Paused => ("Paused", self.theme.accent),
+            RunState::Running => ("Running", self.theme.ok_text),
+            RunState::WaitingInput => ("Waiting for input", self.theme.warn_text),
+            RunState::Halted => ("Halted", self.theme.dim),
+            RunState::Error => ("Error", self.theme.error_text),
         }
     }
 
@@ -957,96 +1056,110 @@ impl VaranApp {
             };
             ui.label(RichText::new(&self.status_msg).color(color));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new(format!("Ln {}, Col {}", self.cursor.0 + 1, self.cursor.1 + 1))
-                        .color(self.theme.dim),
-                );
+                let dim = |s: String| RichText::new(s).color(self.theme.dim).size(12.5);
+                ui.label(dim(format!("Ln {}, Col {}", self.cursor.0 + 1, self.cursor.1 + 1)));
                 ui.separator();
-                ui.label(
-                    RichText::new(format!("{} instructions", self.cpu.steps)).color(self.theme.dim),
-                );
+                ui.label(dim(format!("{} instructions executed", self.cpu.steps)));
                 ui.separator();
-                ui.label(RichText::new(self.file_name()).color(self.theme.dim));
+                ui.label(dim(format!("Tab width {}", self.tab_width)));
             });
         });
     }
 
     fn registers_panel(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
+        let theme = self.theme.clone();
         ui.horizontal(|ui| {
-            ui.heading("Registers");
+            widgets::section_header(ui, &theme, "Registers");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
                 ui.selectable_value(&mut self.reg_hex, false, "Dec");
                 ui.selectable_value(&mut self.reg_hex, true, "Hex");
             });
         });
-        ui.separator();
         let mono = FontId::monospace(13.5);
+        let small_mono = FontId::monospace(12.0);
         let editable = self.state != RunState::Running;
         let mut commit: Option<(usize, u32)> = None;
         let mut cancel_edit = false;
+        let mut start_edit = None;
 
-        egui::Grid::new("regs")
-            .num_columns(3)
-            .striped(true)
-            .spacing([10.0, 3.0])
-            .show(ui, |ui| {
-                for i in 0..16 {
-                    let v = self.cpu.regs[i];
-                    let changed = v != self.prev_regs[i];
-                    let name = match i {
-                        13 => "R13 SP".to_string(),
-                        14 => "R14 LR".to_string(),
-                        15 => "R15 PC".to_string(),
-                        _ => format!("R{i}"),
-                    };
-                    ui.label(RichText::new(name).font(mono.clone()).color(self.theme.dim));
-                    let color = if changed { self.theme.changed } else { self.theme.text };
-
-                    let editing_this = matches!(&self.editing_reg, Some((r, _)) if *r == i);
-                    if editing_this {
-                        let (_, buf) = self.editing_reg.as_mut().unwrap();
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(buf)
-                                .font(mono.clone())
-                                .desired_width(110.0),
-                        );
-                        resp.request_focus();
-                        if ui.input(|inp| inp.key_pressed(Key::Escape)) {
-                            cancel_edit = true;
-                        } else if resp.lost_focus() {
-                            let syms = self.program.as_ref().map(|p| p.symbols.clone()).unwrap_or_default();
-                            match asm::evaluate(buf, &syms) {
-                                Ok(val) => commit = Some((i, val)),
-                                Err(_) => cancel_edit = true,
-                            }
-                        }
-                    } else {
-                        let text = if self.reg_hex {
-                            format!("0x{v:08X}")
-                        } else {
-                            format!("{v}")
-                        };
-                        let resp = ui.add(
-                            egui::Label::new(RichText::new(text).font(mono.clone()).color(color))
-                                .sense(Sense::click()),
-                        );
-                        if editable && resp.double_clicked() {
-                            self.editing_reg = Some((i, format!("0x{v:X}")));
-                        }
-                        resp.on_hover_text(format!(
-                            "Hex: 0x{v:08X}\nUnsigned: {v}\nSigned: {}\nBinary: {:032b}\n\nDouble-click to edit",
-                            v as i32, v
-                        ));
-                    }
-                    ui.label(
-                        RichText::new(format!("{}", v as i32))
-                            .font(FontId::monospace(12.0))
-                            .color(self.theme.dim),
-                    );
-                    ui.end_row();
+        card(ui, &theme, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let row_h = 22.0;
+            for i in 0..16 {
+                let v = self.cpu.regs[i];
+                let changed = v != self.prev_regs[i];
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::click());
+                let painter = ui.painter().clone();
+                if changed {
+                    painter.rect_filled(rect, 3.0, theme.changed_bg);
+                } else if resp.hovered() {
+                    painter.rect_filled(rect, 3.0, theme.stripe.gamma_multiply(2.0));
+                } else if i % 2 == 1 {
+                    painter.rect_filled(rect, 0.0, theme.stripe);
                 }
-            });
+                let alias = match i {
+                    13 => "SP",
+                    14 => "LR",
+                    15 => "PC",
+                    _ => "",
+                };
+                let y = rect.center().y;
+                painter.text(egui::pos2(rect.left() + 4.0, y), egui::Align2::LEFT_CENTER, format!("R{i}"), mono.clone(), theme.dim);
+                if !alias.is_empty() {
+                    painter.text(
+                        egui::pos2(rect.left() + 36.0, y),
+                        egui::Align2::LEFT_CENTER,
+                        alias,
+                        small_mono.clone(),
+                        theme.dim.gamma_multiply(0.8),
+                    );
+                }
+                let value_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 62.0, rect.top() + 1.0),
+                    egui::pos2(rect.left() + 62.0 + 120.0, rect.bottom() - 1.0),
+                );
+                let editing_this = matches!(&self.editing_reg, Some((r, _)) if *r == i);
+                if editing_this {
+                    let (_, buf) = self.editing_reg.as_mut().unwrap();
+                    let te = ui.put(
+                        value_rect,
+                        egui::TextEdit::singleline(buf).font(mono.clone()).margin(egui::vec2(2.0, 0.0)),
+                    );
+                    te.request_focus();
+                    if ui.input(|inp| inp.key_pressed(Key::Escape)) {
+                        cancel_edit = true;
+                    } else if te.lost_focus() {
+                        let syms = self.program.as_ref().map(|p| p.symbols.clone()).unwrap_or_default();
+                        match asm::evaluate(buf, &syms) {
+                            Ok(val) => commit = Some((i, val)),
+                            Err(_) => cancel_edit = true,
+                        }
+                    }
+                } else {
+                    let (main, other) = if self.reg_hex {
+                        (format!("{v:08X}"), format!("{}", v as i32))
+                    } else {
+                        (format!("{}", v as i32), format!("{v:08X}"))
+                    };
+                    let color = if changed { theme.changed } else if v == 0 { theme.dim } else { theme.text };
+                    painter.text(egui::pos2(value_rect.left(), y), egui::Align2::LEFT_CENTER, main, mono.clone(), color);
+                    painter.text(egui::pos2(rect.right() - 4.0, y), egui::Align2::RIGHT_CENTER, other, small_mono.clone(), theme.dim);
+                    if editable && resp.double_clicked() {
+                        start_edit = Some((i, format!("0x{v:X}")));
+                    }
+                    resp.on_hover_text(format!(
+                        "R{i}\nHex: 0x{v:08X}\nUnsigned: {v}\nSigned: {}\nBinary: {}\n\nDouble-click to edit",
+                        v as i32,
+                        binary_grouped(v)
+                    ));
+                }
+            }
+        });
+        if start_edit.is_some() {
+            self.editing_reg = start_edit;
+        }
         if let Some((r, v)) = commit {
             if r == 15 {
                 self.cpu.regs[15] = v & !3;
@@ -1061,102 +1174,139 @@ impl VaranApp {
             self.editing_reg = None;
         }
 
-        ui.add_space(8.0);
-        ui.heading("Flags");
-        ui.separator();
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            let flags = [
-                ("N", "Negative", self.cpu.n, self.prev_flags[0]),
-                ("Z", "Zero", self.cpu.z, self.prev_flags[1]),
-                ("C", "Carry", self.cpu.c, self.prev_flags[2]),
-                ("V", "Overflow", self.cpu.v, self.prev_flags[3]),
-            ];
-            let mut new_vals = [self.cpu.n, self.cpu.z, self.cpu.c, self.cpu.v];
+            widgets::section_header(ui, &theme, "Flags");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!("CPSR {:08X}", self.cpu.cpsr()))
+                        .font(FontId::monospace(12.0))
+                        .color(theme.dim),
+                );
+            });
+        });
+        let flags = [
+            ("N", "Negative", self.cpu.n, self.prev_flags[0]),
+            ("Z", "Zero", self.cpu.z, self.prev_flags[1]),
+            ("C", "Carry", self.cpu.c, self.prev_flags[2]),
+            ("V", "Overflow", self.cpu.v, self.prev_flags[3]),
+        ];
+        let mut toggled = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let w = ((ui.available_width() - 18.0) / 4.0).max(40.0);
             for (idx, (short, long, val, prev)) in flags.iter().enumerate() {
+                let sense = if editable { Sense::click() } else { Sense::hover() };
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 42.0), sense);
+                let painter = ui.painter();
                 let changed = val != prev;
-                let fill = if *val { self.theme.accent.linear_multiply(0.6) } else { Color32::TRANSPARENT };
-                let text_color = if changed { self.theme.changed } else if *val { Color32::WHITE } else { self.theme.dim };
-                let btn = egui::Button::new(
-                    RichText::new(format!("{short} {}", *val as u8)).font(FontId::monospace(14.0)).color(text_color),
-                )
-                .fill(fill)
-                .min_size(egui::vec2(48.0, 26.0));
-                let resp = ui.add_enabled(editable, btn).on_hover_text(format!("{long} flag - click to toggle"));
-                if resp.clicked() {
-                    new_vals[idx] = !new_vals[idx];
+                let (fill, fg) = if *val { (theme.accent, theme.on_accent) } else { (theme.surface, theme.dim) };
+                let fill = if resp.hovered() && editable { fill.gamma_multiply(0.85) } else { fill };
+                let stroke = if changed {
+                    egui::Stroke::new(2.0, theme.changed)
+                } else {
+                    egui::Stroke::new(1.0, theme.border)
+                };
+                painter.rect(rect, 6.0, fill, stroke, egui::StrokeKind::Inside);
+                painter.text(
+                    rect.center() - egui::vec2(0.0, 6.0),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{short} {}", *val as u8),
+                    FontId::monospace(15.0),
+                    fg,
+                );
+                painter.text(
+                    rect.center() + egui::vec2(0.0, 11.0),
+                    egui::Align2::CENTER_CENTER,
+                    *long,
+                    FontId::proportional(10.5),
+                    fg.gamma_multiply(0.85),
+                );
+                let state = if *val { "set" } else { "clear" };
+                if resp.on_hover_text(format!("{long} flag is {state}. Click to toggle.")).clicked() {
+                    toggled = Some(idx);
                 }
             }
-            self.cpu.n = new_vals[0];
-            self.cpu.z = new_vals[1];
-            self.cpu.c = new_vals[2];
-            self.cpu.v = new_vals[3];
         });
-        ui.label(
-            RichText::new(format!("CPSR = 0x{:08X}", self.cpu.cpsr()))
-                .font(FontId::monospace(12.5))
-                .color(self.theme.dim),
-        );
+        match toggled {
+            Some(0) => self.cpu.n = !self.cpu.n,
+            Some(1) => self.cpu.z = !self.cpu.z,
+            Some(2) => self.cpu.c = !self.cpu.c,
+            Some(3) => self.cpu.v = !self.cpu.v,
+            _ => {}
+        }
 
-        ui.add_space(8.0);
-        ui.heading("Next instruction");
-        ui.separator();
-        if self.state == RunState::NotLoaded {
-            ui.label(RichText::new("-").color(self.theme.dim));
-        } else {
+        ui.add_space(6.0);
+        widgets::section_header(ui, &theme, "Next instruction");
+        card(ui, &theme, |ui| {
+            if self.state == RunState::NotLoaded {
+                ui.label(RichText::new("Assemble the program to start.").color(theme.dim));
+                return;
+            }
             let pc = self.cpu.pc();
             let instr = self.cpu.mem.read_u32(pc);
             let text = disassemble(instr, pc, &|a| self.label_for(a));
-            let cond_ok = self.cpu.cond_passed(instr >> 28);
+            let (mn, ops) = text.split_once(' ').unwrap_or((&text, ""));
+            let mut job = LayoutJob::default();
+            let f = FontId::monospace(14.5);
+            job.append(mn, 0.0, TextFormat { font_id: f.clone(), color: theme.syn_mnemonic, ..Default::default() });
+            job.append(&format!(" {}", ops.trim_start()), 0.0, TextFormat { font_id: f, color: theme.text, ..Default::default() });
+            ui.label(job);
             ui.label(
-                RichText::new(text)
-                    .font(FontId::monospace(14.0))
-                    .color(self.theme.syn_mnemonic),
-            );
-            ui.label(
-                RichText::new(format!("at 0x{pc:08X}  ({instr:08X})"))
+                RichText::new(format!("0x{pc:08X}   {instr:08X}"))
                     .font(FontId::monospace(12.0))
-                    .color(self.theme.dim),
+                    .color(theme.dim),
             );
             if instr >> 28 != 0xE {
+                let cond_ok = self.cpu.cond_passed(instr >> 28);
                 ui.label(
-                    RichText::new(if cond_ok { "condition: will execute" } else { "condition: will be skipped" })
-                        .color(if cond_ok { self.theme.ok_text } else { self.theme.warn_text }),
+                    RichText::new(if cond_ok { "Condition passes: will execute" } else { "Condition fails: will be skipped" })
+                        .color(if cond_ok { theme.ok_text } else { theme.warn_text }),
                 );
             }
-        }
+        });
 
-        ui.add_space(8.0);
-        ui.heading("Stack");
-        ui.separator();
+        ui.add_space(6.0);
+        widgets::section_header(ui, &theme, "Stack");
         let sp = self.cpu.regs[13];
-        egui::Grid::new("stack").num_columns(2).spacing([10.0, 2.0]).show(ui, |ui| {
+        card(ui, &theme, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let font = FontId::monospace(12.5);
             for k in 0..8u32 {
                 let a = sp.wrapping_add(4 * k);
                 let v = self.cpu.mem.read_u32(a);
-                let lbl = if k == 0 { format!("SP→ {a:08X}") } else { format!("    {a:08X}") };
-                ui.label(RichText::new(lbl).font(FontId::monospace(12.0)).color(self.theme.dim));
-                ui.label(RichText::new(format!("{v:08X}")).font(FontId::monospace(12.0)));
-                ui.end_row();
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 19.0), Sense::hover());
+                let painter = ui.painter();
+                if k == 0 {
+                    painter.rect_filled(rect, 3.0, theme.accent.gamma_multiply(0.15));
+                }
+                let y = rect.center().y;
+                let tag = if k == 0 { "SP" } else { "" };
+                painter.text(egui::pos2(rect.left() + 4.0, y), egui::Align2::LEFT_CENTER, tag, font.clone(), theme.accent);
+                painter.text(egui::pos2(rect.left() + 32.0, y), egui::Align2::LEFT_CENTER, format!("{a:08X}"), font.clone(), theme.dim);
+                painter.text(
+                    egui::pos2(rect.right() - 4.0, y),
+                    egui::Align2::RIGHT_CENTER,
+                    format!("{v:08X}"),
+                    font.clone(),
+                    if v == 0 { theme.dim } else { theme.text },
+                );
             }
         });
+        ui.add_space(6.0);
     }
 
     fn bottom_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let problems = if self.errors.is_empty() {
-                "Problems".to_string()
-            } else {
-                format!("Problems ({})", self.errors.len())
-            };
-            ui.selectable_value(&mut self.bottom_tab, BottomTab::Console, "Console");
-            ui.selectable_value(&mut self.bottom_tab, BottomTab::Memory, "Memory");
-            let p = ui.selectable_value(&mut self.bottom_tab, BottomTab::Problems, problems);
-            if !self.errors.is_empty() {
-                ui.painter().circle_filled(p.rect.right_top() + egui::vec2(-3.0, 4.0), 3.0, self.theme.error_text);
-            }
-            ui.selectable_value(&mut self.bottom_tab, BottomTab::Symbols, "Symbols");
-        });
-        ui.separator();
+        let theme = self.theme.clone();
+        let problems = if self.errors.is_empty() { None } else { Some((self.errors.len(), theme.breakpoint)) };
+        let tabs = [
+            (BottomTab::Console, "Console".to_string(), None),
+            (BottomTab::Memory, "Memory".to_string(), None),
+            (BottomTab::Problems, "Problems".to_string(), problems),
+            (BottomTab::Symbols, "Symbols".to_string(), None),
+        ];
+        widgets::tab_bar(ui, &theme, &mut self.bottom_tab, &tabs);
+        ui.add_space(4.0);
         match self.bottom_tab {
             BottomTab::Console => self.console(ui),
             BottomTab::Memory => self.memory(ui),
@@ -1173,9 +1323,9 @@ impl VaranApp {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     let prompt = if waiting {
-                        RichText::new("Input ▸").color(self.theme.warn_text).strong()
+                        RichText::new("Input").color(self.theme.warn_text).strong()
                     } else {
-                        RichText::new("Input ▸").color(self.theme.dim)
+                        RichText::new("Input").color(self.theme.dim)
                     };
                     ui.label(prompt);
                     let w = ui.available_width() - 150.0;
@@ -1391,12 +1541,19 @@ impl VaranApp {
     }
 
     fn center(&mut self, ui: &mut egui::Ui) {
-        let editor_title = format!("📝 {}{}", self.file_name(), if self.dirty { " *" } else { "" });
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.center_tab, CenterTab::Editor, editor_title);
-            ui.selectable_value(&mut self.center_tab, CenterTab::Listing, "🔍 Listing / Disassembly");
-        });
-        ui.separator();
+        let theme = self.theme.clone();
+        let editor_title = format!("{}{}", self.file_name(), if self.dirty { " \u{2022}" } else { "" });
+        egui::Frame::new()
+            .fill(theme.chrome_bg)
+            .inner_margin(egui::Margin { left: 6, right: 6, top: 0, bottom: 0 })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let tabs = [
+                    (CenterTab::Editor, editor_title, None),
+                    (CenterTab::Listing, "Listing / Disassembly".to_string(), None),
+                ];
+                widgets::tab_bar(ui, &theme, &mut self.center_tab, &tabs);
+            });
         match self.center_tab {
             CenterTab::Editor => self.editor(ui),
             CenterTab::Listing => self.listing(ui),
@@ -1522,28 +1679,77 @@ impl eframe::App for VaranApp {
             ctx.request_repaint();
         }
         self.update_title(&ctx);
+        if self.applied_dark != Some(self.theme.dark) {
+            self.theme.apply(&ctx);
+            self.applied_dark = Some(self.theme.dark);
+        }
 
-        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.add_space(3.0);
-            self.toolbar(ui);
-            ui.add_space(3.0);
-        });
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        let t = &self.theme;
+        let chrome = |mx: i8, my: i8| {
+            egui::Frame::new()
+                .fill(t.chrome_bg)
+                .inner_margin(egui::Margin::symmetric(mx, my))
+        };
+        let (menu_f, tool_f, status_f, side_f, bottom_f) =
+            (chrome(6, 2), chrome(8, 6), chrome(10, 3), chrome(10, 4), chrome(8, 2));
+        let central_f = egui::Frame::new().fill(t.surface).inner_margin(egui::Margin::ZERO);
+
+        egui::Panel::top("menu").frame(menu_f).show(ui, |ui| self.menu_bar(ui));
+        egui::Panel::top("toolbar").frame(tool_f).show(ui, |ui| self.toolbar(ui));
+        egui::Panel::bottom("status").frame(status_f).show(ui, |ui| self.status_bar(ui));
         egui::Panel::right("registers")
+            .frame(side_f)
             .resizable(true)
-            .default_size(300.0)
-            .min_size(240.0)
+            .default_size(310.0)
+            .min_size(250.0)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().id_salt("regs_scroll").show(ui, |ui| self.registers_panel(ui));
             });
         egui::Panel::bottom("bottom")
+            .frame(bottom_f)
             .resizable(true)
-            .default_size(240.0)
+            .default_size(230.0)
             .min_size(120.0)
             .show(ui, |ui| self.bottom_panel(ui));
-        egui::CentralPanel::default().show(ui, |ui| self.center(ui));
+        egui::CentralPanel::default().frame(central_f).show(ui, |ui| self.center(ui));
+
+        self.cheatsheet.show(&ctx, &self.theme);
+        if self.show_shortcuts {
+            self.shortcuts_window(&ctx);
+        }
+        if self.show_about {
+            self.about_window(&ctx);
+        }
     }
+}
+
+/// `0000 0000 0000 ...` - a 32-bit value in nibble groups.
+fn binary_grouped(v: u32) -> String {
+    let s = format!("{v:032b}");
+    s.as_bytes()
+        .chunks(4)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A bordered "card" on the panel background, used to group a side-panel section.
+fn card<R>(ui: &mut egui::Ui, theme: &Theme, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(theme.surface)
+        .stroke(egui::Stroke::new(1.0, theme.border))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui)
+        })
+        .inner
+}
+
+fn toolbar_divider(ui: &mut egui::Ui, theme: &Theme) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 22.0), Sense::hover());
+    ui.painter().vline(rect.center().x, rect.y_range(), egui::Stroke::new(1.0, theme.border));
 }
 
 
@@ -1559,5 +1765,105 @@ mod tests {
         } else {
             assert_eq!((save.as_str(), save_as.as_str()), ("Ctrl+S", "Ctrl+Shift+S"));
         }
+    }
+
+    fn harness() -> egui_kittest::Harness<'static, VaranApp> {
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1280.0, 820.0))
+            .allow_missing_glyphs()
+            .build_eframe(|cc| VaranApp::empty(cc));
+        h.run_steps(2);
+        h
+    }
+
+    #[test]
+    fn f1_toggles_instruction_reference() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness();
+        assert!(h.query_by_label("Search reference").is_none());
+        h.key_press(Key::F1);
+        h.run_steps(2);
+        assert!(h.state().cheatsheet.open);
+        assert!(h.query_by_label("Search reference").is_some());
+        h.key_press(Key::F1);
+        h.run_steps(2);
+        assert!(!h.state().cheatsheet.open);
+    }
+
+    #[test]
+    fn help_menu_opens_instruction_reference() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness();
+        h.get_by_label("Help").click();
+        h.run_steps(2);
+        h.get_by_label_contains("Instruction Reference").click();
+        h.run_steps(2);
+        assert!(h.state().cheatsheet.open);
+        assert!(h.query_by_label("Search reference").is_some());
+    }
+
+    #[test]
+    fn theme_switch_restyles_widgets() {
+        let mut h = harness();
+        assert!(h.ctx.global_style().visuals.dark_mode);
+        h.state_mut().theme = Theme::light();
+        h.run_steps(2);
+        assert!(!h.ctx.global_style().visuals.dark_mode);
+    }
+
+    #[test]
+    fn binary_is_grouped_in_nibbles() {
+        assert_eq!(binary_grouped(0xA5), "0000 0000 0000 0000 0000 0000 1010 0101");
+    }
+
+    /// Renders the window offscreen to `target/preview/*.png` for visual review.
+    /// Needs a GPU adapter, so it's opt-in: `cargo test preview -- --ignored`.
+    #[test]
+    #[ignore]
+    fn preview() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/preview");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shot = |name: &str, setup: &dyn Fn(&mut VaranApp)| {
+            let mut h = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(1280.0, 820.0))
+                .wgpu()
+                .allow_missing_glyphs()
+                .build_eframe(|cc| VaranApp::empty(cc));
+            setup(h.state_mut());
+            h.run_steps(4);
+            let img = h.render().unwrap();
+            img.save(dir.join(format!("{name}.png"))).unwrap();
+        };
+        shot("initial", &|_| {});
+        shot("stepped", &|a| {
+            a.run();
+            a.state = RunState::Paused;
+            a.reset();
+            for _ in 0..6 {
+                a.step();
+            }
+            a.cpu.output.push_str("Hello from ARM!\n");
+        });
+        shot("light", &|a| {
+            a.theme = Theme::light();
+            a.assemble_and_load();
+            a.step();
+        });
+        shot("errors", &|a| {
+            a.source.push_str("        MOVX R0, #1\n        B nowhere\n");
+            a.assemble_and_load();
+        });
+        shot("reference", &|a| a.cheatsheet.toggle());
+        shot("reference_search", &|a| {
+            a.cheatsheet.toggle();
+            a.cheatsheet.filter = "carry".into();
+        });
+        shot("listing_memory", &|a| {
+            a.assemble_and_load();
+            a.step();
+            a.center_tab = CenterTab::Listing;
+            a.bottom_tab = BottomTab::Memory;
+        });
+        shot("shortcuts", &|a| a.show_shortcuts = true);
     }
 }
