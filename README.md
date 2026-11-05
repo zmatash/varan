@@ -3,7 +3,23 @@
 A modern Windows alternative to KoMoDo for writing, assembling, running and
 debugging ARM assembly. It is written in Rust with an [egui](https://github.com/emilk/egui) interface.
 
-## Running
+## Download
+
+Get the latest build from the [Releases page](https://github.com/zmatash/varan/releases/latest):
+
+- **Windows:** download `Varan-*-windows-x64.exe` and run it. It needs no installer. If
+  SmartScreen warns you, click *More info* and then *Run anyway*.
+- **macOS** (Apple Silicon and Intel, macOS 11+): open the `.dmg` and drag Varan to Applications.
+  The app isn't notarised yet, so the first time you open it, right-click Varan and choose *Open*.
+  If macOS says it is "damaged", run `xattr -cr /Applications/Varan.app`.
+- **Linux** (x86-64): extract the `.tar.gz` and run `./varan`.
+
+## Making a release
+
+Bump `version` in `Cargo.toml`, commit, then `git tag v0.2.0 && git push origin v0.2.0`.
+GitHub Actions tests and builds all three platforms, then creates a **draft** release for you to publish.
+
+## Running from source
 
 ```
 cargo run --release                 # start with a sample program

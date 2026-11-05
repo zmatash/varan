@@ -1,0 +1,131 @@
+# Builds Varan for Windows, macOS and Linux and attaches the files to a
+# draft GitHub Release.
+#
+#   1. Bump `version` in Cargo.toml and commit.
+#   2. git tag v0.2.0 && git push origin v0.2.0
+#   3. Review the draft on the Releases page and click Publish.
+#
+# "Run workflow" (workflow_dispatch) builds and tests everything without
+# creating a release; the files are attached to the workflow run as artifacts.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-latest
+          - name: macos
+            os: macos-15
+          - name: linux
+            os: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read version
+        id: ver
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.name == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Install Linux build dependencies
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Package (Windows)
+        if: matrix.name == 'windows'
+        run: |
+          cargo build --release --locked
+          mkdir dist
+          cp target/release/varan.exe "dist/Varan-${{ steps.ver.outputs.version }}-windows-x64.exe"
+
+      - name: Package (macOS universal .dmg)
+        if: matrix.name == 'macos'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          v=${{ steps.ver.outputs.version }}
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          app=staging/Varan.app
+          mkdir -p "$app/Contents/MacOS" dist
+          lipo -create -output "$app/Contents/MacOS/varan" \
+            target/aarch64-apple-darwin/release/varan \
+            target/x86_64-apple-darwin/release/varan
+          sed "s/@VERSION@/$v/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          # Ad-hoc signature: required for arm64, but not a Developer ID, so
+          # Gatekeeper still asks users to approve the app on first launch.
+          codesign --force --deep --sign - "$app"
+          ln -s /Applications staging/Applications
+          hdiutil create -volname Varan -srcfolder staging -ov -format UDZO \
+            "dist/Varan-$v-macos-universal.dmg"
+
+      - name: Package (Linux .tar.gz)
+        if: matrix.name == 'linux'
+        run: |
+          d="Varan-${{ steps.ver.outputs.version }}-linux-x64"
+          cargo build --release --locked
+          mkdir -p "$d" dist
+          cp target/release/varan packaging/linux/varan.desktop README.md "$d/"
+          tar czf "dist/$d.tar.gz" "$d"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: varan-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Create draft release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Varan $GITHUB_REF_NAME" \
+            --generate-notes \
+            --draft

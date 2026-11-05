@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Varan
+GenericName=ARM Emulator
+Comment=Write, assemble, run and debug ARM assembly
+Exec=varan %f
+Terminal=false
+Categories=Development;Education;
+MimeType=text/x-asm;
